@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,6 +39,8 @@ type FileOutput struct {
 	backChan   chan []byte
 	folderPerm os.FileMode
 	timerChan  <-chan time.Time
+	// Only used if the output file is to be rotated.
+	bytesWritten int64
 }
 
 // ConfigStruct for FileOutput plugin.
@@ -70,6 +73,9 @@ type FileOutputConfig struct {
 	// output. We do some magic to default to true if ProtobufEncoder is used,
 	// false otherwise.
 	UseFraming *bool `toml:"use_framing"`
+
+	// Indicates whether the output file should be rotated by heka.
+	RotateFile *bool `toml:"rotate_file"`
 }
 
 func (o *FileOutput) ConfigStruct() interface{} {
@@ -134,7 +140,34 @@ func (o *FileOutput) openFile() (err error) {
 		return
 	}
 	o.file, err = os.OpenFile(o.Path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, o.perm)
+	stat, err := o.file.Stat()
+	if err != nil {
+		return err
+	}
+	o.bytesWritten = stat.Size()
 	return
+}
+
+// rotateFile renames the current file, closes it, then re-opens the original file.
+func (o *FileOutput) rotateFile() error {
+	err := os.Rename(o.Path, rotateFilename(o.Path, time.Now()))
+	if err != nil {
+		return err
+	}
+	o.file.Close()
+	return o.openFile()
+}
+
+// rotateFilename appends the current UTC timestamp to the filename,
+// preserving the file extension.
+func rotateFilename(path string, time time.Time) string {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	prefixParts := strings.Split(base, ".")
+	prefix := prefixParts[:len(prefixParts)-1]
+	ext := filepath.Ext(base)
+	timestamp := time.Format("2006-01-02T15-04-05.000")
+	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
 }
 
 func (o *FileOutput) Run(or OutputRunner, h PluginHelper) (err error) {
@@ -257,6 +290,33 @@ func (o *FileOutput) committer(or OutputRunner, wg *sync.WaitGroup) {
 				// Channel is closed => we're shutting down, exit cleanly.
 				break
 			}
+
+			var rotateSize int = 10000
+			var chunkSize int
+			fmt.Printf("Batch size: %d\n", len(outBatch))
+			for start := 0; start < len(outBatch); start += chunkSize {
+				end := start + rotateSize
+				if end > len(outBatch) {
+					end = len(outBatch)
+				}
+				n, err := o.file.Write(outBatch[start:end])
+				if err != nil {
+					or.LogError(fmt.Errorf("Can't write to %s: %s", o.Path, err))
+				} else if n != end-start {
+					or.LogError(fmt.Errorf("Truncated output for %s", o.Path))
+				} else {
+					o.file.Sync()
+				}
+				chunkSize = end - start
+				fmt.Printf("Wrote start: %d, end: %d\n", start, end)
+			}
+
+			// Rotate file if necessary.
+			/*err = o.rotateFile()
+			if err != nil {
+				or.LogError(fmt.Errorf("Error rotating file %s: %s", o.Path, err))
+			}
+
 			n, err := o.file.Write(outBatch)
 			if err != nil {
 				or.LogError(fmt.Errorf("Can't write to %s: %s", o.Path, err))
@@ -264,7 +324,7 @@ func (o *FileOutput) committer(or OutputRunner, wg *sync.WaitGroup) {
 				or.LogError(fmt.Errorf("Truncated output for %s", o.Path))
 			} else {
 				o.file.Sync()
-			}
+			}*/
 			outBatch = outBatch[:0]
 			o.backChan <- outBatch
 		case <-hupChan:
